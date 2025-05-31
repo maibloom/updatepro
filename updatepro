@@ -1,50 +1,169 @@
 #!/bin/bash
-# updatepro - Automatically check for updates for pacman and flatpak every 15 minutes
-# and send a notification when packages have been updated.
+# updatepro: A configurable updater for pacman and flatpak.
+#
+# Usage:
+#   ./updatepro                # Runs the update loop
+#   ./updatepro --configure    # Interactively create/update /etc/updatepro.conf
+#   ./updatepro --install      # Install systemd service and timer units based on the config
+#
+# Configuration file is located at /etc/updatepro.conf.
+# It can define the following variables:
+#   CHECK_INTERVAL      - Interval between update checks (in seconds, default: 900)
+#   PACMAN_TIMEOUT      - Total time to wait for a pacman lock (default: 60)
+#   PACMAN_LOCK_WAIT    - Wait interval between checking for the pacman lock (default: 5)
+#   NOTIFY_TITLE        - Notification title (default: "updatepro")
 
-# Function to send notifications.
+CONFIG_FILE="/etc/updatepro.conf"
+
+# Load configuration file if it exists
+if [ -f "$CONFIG_FILE" ]; then
+    source "$CONFIG_FILE"
+fi
+
+# Set default values if not provided by the configuration.
+: "${CHECK_INTERVAL:=900}"
+: "${PACMAN_TIMEOUT:=60}"
+: "${PACMAN_LOCK_WAIT:=5}"
+: "${NOTIFY_TITLE:=updatepro}"
+
+# Function: Send a desktop notification.
 send_notification() {
-    title="$1"
-    message="$2"
-    # If running as root, try to send the notification as the logged‐in user.
+    local title="$1"
+    local message="$2"
+    # If running as root, attempt to send the notification to the logged-in user's display.
     if [ "$EUID" -eq 0 ]; then
+        local user
         user=$(logname)
-        # Assumes the display is :0 – adjust DISPLAY and XAUTHORITY if needed.
         sudo -u "$user" DISPLAY=:0 notify-send "$title" "$message"
     else
         notify-send "$title" "$message"
     fi
 }
 
+# Function: Wait for the pacman database to be unlocked.
+wait_for_pacman_lock() {
+    local timeout="$PACMAN_TIMEOUT"
+    while [ -f /var/lib/pacman/db.lck ] && [ "$timeout" -gt 0 ]; do
+        echo "Pacman database is locked. Waiting for ${PACMAN_LOCK_WAIT} seconds..."
+        sleep "$PACMAN_LOCK_WAIT"
+        timeout=$(( timeout - PACMAN_LOCK_WAIT ))
+    done
+    if [ -f /var/lib/pacman/db.lck ]; then
+        echo "Pacman lock still exists after waiting. Skipping pacman update."
+        return 1
+    fi
+    return 0
+}
+
+# Function: Interactively configure updatepro.
+configure_updatepro() {
+    echo "Configuring updatepro..."
+    read -rp "Enter update interval in seconds (default: 900): " input_interval
+    read -rp "Enter pacman timeout in seconds (default: 60): " input_timeout
+    read -rp "Enter pacman lock wait interval in seconds (default: 5): " input_lock_wait
+    read -rp "Enter notification title (default: updatepro): " input_title
+
+    # Use defaults if inputs are empty.
+    CHECK_INTERVAL="${input_interval:-900}"
+    PACMAN_TIMEOUT="${input_timeout:-60}"
+    PACMAN_LOCK_WAIT="${input_lock_wait:-5}"
+    NOTIFY_TITLE="${input_title:-updatepro}"
+
+    echo "Writing configuration to $CONFIG_FILE..."
+    sudo tee "$CONFIG_FILE" > /dev/null <<EOF
+# updatepro Configuration File
+CHECK_INTERVAL=$CHECK_INTERVAL
+PACMAN_TIMEOUT=$PACMAN_TIMEOUT
+PACMAN_LOCK_WAIT=$PACMAN_LOCK_WAIT
+NOTIFY_TITLE=$NOTIFY_TITLE
+EOF
+    echo "Configuration saved to $CONFIG_FILE"
+}
+
+# Function: Install systemd service and timer units.
+install_systemd_units() {
+    echo "Installing systemd units for updatepro..."
+
+    # Determine the full path to this script.
+    SCRIPT_PATH=$(realpath "$0")
+    BASH_PATH=$(which bash)
+
+    # Create the systemd service unit (runs updatepro as a persistent service).
+    sudo tee /etc/systemd/system/updatepro.service > /dev/null <<EOF
+[Unit]
+Description=Automatically check for pacman and flatpak updates using updatepro
+
+[Service]
+Type=simple
+ExecStart=$BASH_PATH $SCRIPT_PATH
+Restart=always
+RestartSec=60
+EOF
+
+    # Create a timer unit that triggers the service based on CHECK_INTERVAL.
+    sudo tee /etc/systemd/system/updatepro.timer > /dev/null <<EOF
+[Unit]
+Description=Run updatepro every $CHECK_INTERVAL seconds
+
+[Timer]
+OnBootSec=${CHECK_INTERVAL}s
+OnUnitActiveSec=${CHECK_INTERVAL}s
+Unit=updatepro.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    sudo systemctl daemon-reload
+    sudo systemctl enable updatepro.timer
+    sudo systemctl start updatepro.timer
+    echo "updatepro is installed as a systemd service."
+    echo "It will automatically run every $CHECK_INTERVAL seconds."
+}
+
+# Process command-line arguments.
+case "$1" in
+    --configure)
+        configure_updatepro
+        exit 0
+        ;;
+    --install)
+        install_systemd_units
+        exit 0
+        ;;
+    *)
+        ;;
+esac
+
+# Main update loop.
 while true; do
     updated_packages=""
 
     echo "Checking for pacman updates..."
     # Check for available pacman updates.
-    # pacman -Qu prints only foreign/outdated packages.
     pacman_updates=$(pacman -Qu 2>/dev/null)
     if [ -n "$pacman_updates" ]; then
-        echo "Updating pacman packages..."
-        # Update the system with no confirmation.
-        sudo pacman -Syu --noconfirm
-        updated_packages+="Pacman "
+        if wait_for_pacman_lock; then
+            echo "Updating pacman packages..."
+            sudo pacman -Syu --noconfirm
+            updated_packages+="Pacman "
+        else
+            echo "Skipped pacman update due to persistent lock."
+        fi
     fi
 
     echo "Checking for flatpak updates..."
-    # Attempt a flatpak update in noninteractive mode
     flatpak_output=$(flatpak update --assumeyes --noninteractive 2>&1)
-    # If the output does NOT state "No updates", then assume updates were applied.
+    # If flatpak update output does not include "No updates", assume updates were applied.
     if ! echo "$flatpak_output" | grep -q "No updates"; then
-        # The flatpak command both checks and applies updates here.
         updated_packages+="Flatpak "
     fi
 
     if [ -n "$updated_packages" ]; then
-        send_notification "updatepro" "The following packages have been updated: $updated_packages"
+        send_notification "$NOTIFY_TITLE" "The following updates were installed: $updated_packages"
     else
         echo "No updates available at $(date)."
     fi
 
-    # Wait for 15 minutes (900 seconds) before checking again.
-    sleep 900
+    sleep "$CHECK_INTERVAL"
 done
